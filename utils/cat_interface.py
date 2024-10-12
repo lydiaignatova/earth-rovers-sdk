@@ -10,16 +10,35 @@ import sys
 import os
 import json
 
+import select
+
+
+
 class JoyStickInterface: 
     pass
 
 class APIInterface:
-    def __init__(self, api_key, base_url, command_interface, joystick_id=0, frame_rate=30, data_rate=None):
+    def __init__(self, 
+                 api_key, 
+                 base_url, 
+                 command_interface, 
+                 joystick_id=0, 
+                 frame_rate=30, 
+                 save_dir= None,
+                 data_rate=None):
+        if save_dir is not None:
+            self.save_dir = save_dir
+            self.save_imgs = True
+        else:
+            self.save_imgs = False
         self.base_url = base_url
-        self.api_key = api_key
+
         # Sending commands 
         self.command_interface = command_interface
         self.joystick_id = joystick_id
+
+        self.vel_lin = 0.0
+        self.vel_ang = 0.0
 
         if self.command_interface == "joystick":
             pygame.init()
@@ -27,7 +46,8 @@ class APIInterface:
             self.joystick = pygame.joystick.Joystick(self.joystick_id)
             self.joystick.init()
         elif self.command_interface == "keyboard":
-            raise NotImplementedError("Keyboard interface not implemented yet")
+            pygame.init()
+            # raise NotImplementedError("Keyboard interface not implemented yet")
             
         # Receive data
         self.frame_rate = frame_rate
@@ -43,12 +63,8 @@ class APIInterface:
     def send_velocity_command(self, linear, angular):
         print("Linear: ", linear, "Angular: ", angular)
         url = f"{self.base_url}/control"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            }
         data = json.dumps({"command": {"linear": linear, "angular": angular}})
-        response = requests.post(url, headers=headers, data=data)
+        response = requests.post(url, data=data)
         response = response.json()
         if response["message"] == 'Command sent successfully':
             return True 
@@ -75,6 +91,10 @@ class APIInterface:
             self.current_front_frame = (front_frame, timestamp)
             self.current_rear_frame = (rear_frame, timestamp) 
             self.current_map = (map_frame, timestamp)
+        # save the image if saving
+        if self.save_imgs:
+            self.current_front_frame[0].save(f"{self.save_dir}/{timestamp}_front.jpg")
+
         return True
     
     def send_joy_commands(self):
@@ -87,7 +107,6 @@ class APIInterface:
         else:
             return False
         
-
         if event.type == pygame.JOYAXISMOTION:
             linear = self.joystick.get_axis(4)*-1
             angular = self.joystick.get_axis(3)*-1
@@ -99,6 +118,55 @@ class APIInterface:
             self.send_velocity_command(linear, angular)
 
         return True
+
+    def send_key_commands(self):
+        print("Enter w a s d commands, with q to quit.")
+        i, o, e = select.select([sys.stdin], [], [], 0.001)
+    
+        if i:  # If there's input within the timeout
+            command = sys.stdin.readline().strip().lower()
+
+            if command == 'w':  # Move forward
+                self.vel_lin = min(self.vel_lin + 0.1, 1.0)
+            elif command == 's':  # Move backward
+                self.vel_lin = max(self.vel_lin - 0.1, 0.0)
+            elif command == 'a':  # Turn left
+                self.vel_ang = min(self.vel_ang + 0.1, 1.0)
+            elif command == 'd':  # Turn right
+                self.vel_ang = max(self.vel_ang - 0.1, 0.0)
+            elif command == 'q':  # Quit
+                print("Quitting command input.")
+                self.vel_lin = self.vel_ang = 0.0
+            else:
+                print("Invalid command. Please use 'w', 'a', 's', 'd', or 'q'.")
+                self.vel_lin = self.vel_ang = 0.0
+        else:
+            print("No input received, sending current velocity...")
+
+        # Continuously send the current velocity values even if no new input is received
+        self.send_velocity_command(self.vel_lin, self.vel_ang)
+        # print(f"Current velocity: linear {self.vel_lin}, angular {self.vel_ang}")
+
+    
+        # if command == 'w':  # Move forward
+        #     self.vel_lin = min(self.vel_lin + 0.1, 1.0) # Set your desired speed
+        # elif command == 's':  # Move backward
+        #     self.vel_lin = max(self.vel_lin - 0.1, 0.0)
+        # elif command == 'a':  # Turn left
+        #     self.vel_ang = min(self.vel_ang + 0.1, 1.0)
+        # elif command == 'd':  # Turn right
+        #     self.vel_ang = max(self.vel_ang - 0.1, 0.0)
+        
+        # elif command == 'q':  # Quit
+        #     print("Quitting command input.")
+        #     self.vel_lin = self.vel_ang = 0.0
+        # else:
+        #     print("Invalid command. Please use 'w', 'a', 's', 'd', or 'q'.")
+        #     linear = self.vel_ang = 0.0
+
+        # print(f"Current velocity {self.vel_lin} linear {self.vel_ang} angular")
+
+        # self.send_velocity_command(self.vel_lin, self.vel_ang)
 
     def image_loop(self, lock):
         while True:
@@ -132,7 +200,11 @@ class APIInterface:
     
 if __name__ == "__main__":
     api_key = os.getenv("SDK_API_TOKEN")
-    api_interface = APIInterface(api_key, "http://localhost:8000", "joystick", frame_rate=30, data_rate=30)
+    api_interface = APIInterface(api_key, "http://localhost:8000", 
+                                 "keyboard", 
+                                 frame_rate=30, 
+                                #  save_dir = "front",
+                                 data_rate=30)
     api_interface.start()
 
 
