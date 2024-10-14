@@ -29,8 +29,8 @@ def observation_format(observation_key_type):
             "rear_frame": tf.TensorSpec((), tf.string, name="rear_frame"),
             "map_frame": tf.TensorSpec((), tf.string, name="map_frame"),
 
-            "timestamp_img": tf.TensorSpec((), tf.float64, name="timestamp_img"),
-            "timestamp_data": tf.TensorSpec((), tf.float64, name="timestamp_data"),
+            "timestamp_img": tf.TensorSpec((), tf.float32, name="timestamp_img"),
+            "timestamp_data": tf.TensorSpec((), tf.float32, name="timestamp_data"),
 
             "battery": tf.TensorSpec((), tf.int32, name="battery"),
             "signal_level": tf.TensorSpec((), tf.int32, name="signal_level"),
@@ -38,26 +38,38 @@ def observation_format(observation_key_type):
             "lamp": tf.TensorSpec((), tf.int32, name="lamp"),
             "speed": tf.TensorSpec((), tf.float32, name="speed"),
             "gps_signal": tf.TensorSpec((), tf.float32, name="gps_signal"),
-            "latitude": tf.TensorSpec((), tf.float64, name="latitude"),  # for precision with coordinates
-            "longitude": tf.TensorSpec((), tf.float64, name="longitude"), # for precision with coordinates
+            "latitude": tf.TensorSpec((), tf.float32, name="latitude"),  # for precision with coordinates
+            "longitude": tf.TensorSpec((), tf.float32, name="longitude"), # for precision with coordinates
             "vibration": tf.TensorSpec((), tf.float32, name="vibration"),
-            # "timestamp": tf.TensorSpec((), tf.float64, name="timestamp"), # 64-bit for timestamp precision
-            "accels": tf.TensorSpec((6, 4), tf.float64, name="accels"),   # 6x4 matrix for accelerometer data
-            "gyros": tf.TensorSpec((5, 4), tf.float64, name="gyros"),     # 5x4 matrix for gyroscope data
-            "mags": tf.TensorSpec((1, 4), tf.float64, name="mags"),       # 1x4 matrix for magnetometer data
-            "rpms": tf.TensorSpec((5, 5), tf.float64, name="rpms"),       # 5x5 matrix for RPM data
+            # "timestamp": tf.TensorSpec((), tf.float32, name="timestamp"), # 64-bit for timestamp precision
+            "accels": tf.TensorSpec((6, 4), tf.float32, name="accels"),   # 6x4 matrix for accelerometer data
+            "gyros": tf.TensorSpec((5, 4), tf.float32, name="gyros"),     # 5x4 matrix for gyroscope data
+            "mags": tf.TensorSpec((1, 4), tf.float32, name="mags"),       # 1x4 matrix for magnetometer data
+            "rpms": tf.TensorSpec((5, 5), tf.float32, name="rpms"),       # 5x5 matrix for RPM data
 
-            "action_state_source": tf.TensorSpec((), tf.string, name="action_state_source"),
+            # "action_state_source": tf.TensorSpec((), tf.string, name="action_state_source"),
             "last_action_linear": tf.TensorSpec((3,), tf.float32, name="last_action_linear"),
             "last_action_angular": tf.TensorSpec((3,), tf.float32, name="last_action_angular"),
         }
     else: 
         raise ValueError(f"Unknown observation config type {observation_key_type}")
 
+def record_data_format(observation_key_type):
+    """ FOR RLDS (need is_first, is_last, is_terminal)"""
+    return {
+        "observation": {
+            **observation_format(observation_key_type),
+        },
+        "action": tf.TensorSpec((6,), tf.float32, name="action"),
+        "is_first": tf.TensorSpec((), tf.bool, name="is_first"),
+        "is_last": tf.TensorSpec((), tf.bool, name="is_last"),
+        "is_terminal": tf.TensorSpec((), tf.bool, name="is_terminal"),
+    }
+
 def make_action_config(action_config_type):
     if action_config_type == "frodobot":
         return ActionConfig(
-            port_number=1111,
+            port_number=1235,
             action_keys=["action_vw"],
             observation_keys=list(observation_format(action_config_type).keys()),
         )

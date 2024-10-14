@@ -27,8 +27,8 @@ class FrodoServer():
             "map_frame": np.array(b"", dtype=bytes),
 
             # Timestamp
-            "timestamp_img": np.zeros((), dtype=np.float64),
-            "timestamp_data": np.zeros((), dtype=np.float64),
+            "timestamp_img": np.zeros((), dtype=np.float32),
+            "timestamp_data": np.zeros((), dtype=np.float32),
 
             # Other sensor data
             "battery": np.zeros((), dtype=np.int32),
@@ -37,19 +37,19 @@ class FrodoServer():
             "lamp": np.zeros((), dtype=np.int32),
             "speed": np.zeros((), dtype=np.float32),
             "gps_signal": np.zeros((), dtype=np.float32),
-            "latitude": np.zeros((), dtype=np.float64),
-            "longitude": np.zeros((), dtype=np.float64),
+            "latitude": np.zeros((), dtype=np.float32),
+            "longitude": np.zeros((), dtype=np.float32),
             "vibration": np.zeros((), dtype=np.float32),
 
             # Acceleration, gyroscope, magnetometer, and RPM data
-            "accels": np.zeros((6, 4), dtype=np.float64),
-            "gyros": np.zeros((5, 4), dtype=np.float64),
-            "mags": np.zeros((1, 4), dtype=np.float64),
-            "rpms": np.zeros((5, 5), dtype=np.float64),
+            "accels": np.zeros((6, 4), dtype=np.float32),
+            "gyros": np.zeros((5, 4), dtype=np.float32),
+            "mags": np.zeros((1, 4), dtype=np.float32),
+            "rpms": np.zeros((5, 5), dtype=np.float32),
 
-            "action_state_source": np.zeros((), dtype=str),
-            "last_action_linear": np.zeros((3,), dtype=str),
-            "last_action_angular": np.zeros((3,), dtype=str),
+            # "action_state_source": np.zeros((), dtype=str),
+            "last_action_linear": np.zeros((3,), dtype=np.float32),
+            "last_action_angular": np.zeros((3,), dtype=np.float32),
         }
         print("Observation type set up")
 
@@ -85,8 +85,8 @@ class FrodoServer():
         response = requests.post(url, data=data)
         response = response.json()
 
-        self._latest_obs["last_action_linear"] = np.array([linear, 0, 0])
-        self._latest_obs["last_action_angular"] = np.array([0, 0, angular])
+        self._latest_obs["last_action_linear"] = np.array([linear, 0.0, 0.0])
+        self._latest_obs["last_action_angular"] = np.array([0.0, 0.0, angular])
         
         if response["message"] == 'Command sent successfully':
             return True 
@@ -101,7 +101,10 @@ class FrodoServer():
             return False
         
         response = response.json()
-        response["timestamp_data"] = response.pop("timestamp", None)
+        if response is None:
+            return False
+        
+        response["timestamp_data"] = tf.strings.to_number(response.pop("timestamp", None), out_type=tf.float32) 
         
         with lock:
             for key in response.keys():
@@ -116,6 +119,9 @@ class FrodoServer():
             return False
         
         response = response.json()
+        if response is None:
+            return False
+        
         response["timestamp_img"] = response.pop("timestamp", None)
 
         with lock:
