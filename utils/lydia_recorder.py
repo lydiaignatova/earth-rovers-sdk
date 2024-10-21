@@ -59,6 +59,8 @@ class Recorder():
         self.max_time = max_time
         self.start_time = time.time()
 
+        self.max_traj_len = 200
+
         # set up save location 
         data_dir = save_dir
         if not os.path.exists(data_dir):
@@ -142,12 +144,23 @@ class Recorder():
         if self.first:
             self.first = False
 
+        if self.last:
+            print("End of trajectory")
+            self.first = True
+            self.last = False
+
         self.data_store.insert(formatted_obs)
 
     def tick(self): 
         obs = self.action_client.obs() 
         if obs is not None:
             self.save(obs)
+            self.traj_len += 1
+
+            if self.traj_len >= self.max_traj_len:
+                self.traj_len = 0
+                self.last = True
+
             
         if self.max_time is not None:
             if time.time() - self.start_time > self.max_time:

@@ -57,7 +57,7 @@ def get_joystick_input():
         axis_value = joystick.get_axis(i)
         axes_values.append(axis_value - calibrated_axes[i])
     
-    linear, angular = -0.4 * axes_values[1], -0.6 * axes_values[0]
+    linear, angular = -1 * axes_values[1], -0.6 * axes_values[0]
     return linear, angular
 
 
