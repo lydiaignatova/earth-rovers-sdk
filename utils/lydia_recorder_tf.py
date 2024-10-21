@@ -73,46 +73,38 @@ class Recorder():
         os.makedirs(self.datastore_path)
 
         
-        # setting up writer
-        self.traj_step = 0
-        self.dtype = utils.observation_format_numpy()
-        self.clear_obs()
+        # setting up rlds writer
+        self.image_size = (64, 64)
+        data_spec = utils.record_data_format("frodobot")
+    
+        self.writer = RLDSWriter(
+            dataset_name="test",
+            data_spec = data_spec,
+            data_directory = self.datastore_path,
+            version = self.version,
+            max_episodes_per_file = 100,
+        )
 
-        atexit.register(self.flush_data) 
+        atexit.register(self.writer.close) 
+
+        self.data_store = EpisodicTFDataStore(
+            capacity=1000,
+            data_spec= data_spec,
+            rlds_logger = self.writer
+        )
         print("Datastore set up")
-
-    def flush_data(self):
-        if self.observations is None or len(self.observations) == 0:
-            return
-
-        first_img_time = int(self.observations[0][0]) # corresponds to timestamp_img
-        file_prefix = f"{self.datastore_path}/{first_img_time}_{self.traj_step}"
-
-        
-        # save EVERYTHING ELSE
-        obs_array = np.array(self.observations, dtype=self.dtype)
-        np.savez(f"{file_prefix}_observations.npz", obs_array=obs_array)
-
-        # save VIDEOS
-        utils.write_video(self.imgs["front"], f"{file_prefix}_front.mp4", byte_string_frames = False, fps=30)
-        utils.write_video(self.imgs["rear"], f"{file_prefix}_rear.mp4", byte_string_frames = False, fps=30)
-        utils.write_video(self.imgs["map"], f"{file_prefix}_map.mp4", byte_string_frames = False, fps=30)
-
-
-        # reset for next trajectory 
-        self.traj_step += 1
-        self.clear_obs()
-        
-    def clear_obs(self):
-        self.observations = []
-        self.imgs = {"front": [],
-                     "rear": [],
-                     "map": []}
-        self.traj_len = 0
-
+            
     def run(self):
         loop_time = 1 / self.tick_rate
         start_time = time.time()
+
+        self.first = True
+        self.last = False
+        self.terminal = False
+
+        self.just_crashed = False
+        self.traj_len = 0
+        self.curr_goal = None 
 
         while True:
             new_start_time = time.time()
@@ -123,13 +115,41 @@ class Recorder():
 
             self.tick()
 
+    def int_image(self, img):
+        return np.asarray((img * IMAGENET_STD + IMAGENET_MEAN) * 255, dtype = np.uint8)
+
     def save(self, obs):
+        # convert everything to float32! 
+        obs["front_frame"] = tf.convert_to_tensor(obs["front_frame"]) 
 
-        self.imgs["front"].append(utils.decode_from_base64(obs.pop("front_frame", None)))
-        self.imgs["rear"].append(utils.decode_from_base64(obs.pop("rear_frame", None)))
-        self.imgs["map"].append(utils.decode_from_base64(obs.pop("map_frame", None)))
+        for k in ["battery", "signal_level", "orientation", "lamp"]:
+            # print(f"{k} has type{type(obs[k])}")
+            obs[k] = tf.cast(obs[k], dtype=tf.int32)
+                  
+        for k in ["timestamp_data", "timestamp_img", "speed", "gps_signal",
+                  "latitude", "longitude", "vibration", "accels",
+                  "gyros", "mags", "rpms", "last_action_linear", "last_action_angular"]:
+            # print(f"{k} has type{type(obs[k])}")
+            obs[k] = tf.cast(obs[k], dtype=tf.float32)   
+   
 
-        self.observations.append(utils.extract_ordered_values(obs, self.dtype))
+        formatted_obs = {
+            "observation": obs,
+            "action": tf.concat([obs["last_action_linear"], obs["last_action_angular"]], axis = 0),
+            "is_first": self.first, 
+            "is_last": self.last, 
+            "is_terminal": self.terminal, 
+        }
+
+        if self.first:
+            self.first = False
+
+        if self.last:
+            print("End of trajectory")
+            self.first = True
+            self.last = False
+
+        self.data_store.insert(formatted_obs)
 
     def tick(self): 
         obs = self.action_client.obs() 
@@ -138,7 +158,8 @@ class Recorder():
             self.traj_len += 1
 
             if self.traj_len >= self.max_traj_len:
-                self.flush_data()
+                self.traj_len = 0
+                self.last = True
 
             
         if self.max_time is not None:

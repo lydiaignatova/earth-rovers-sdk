@@ -13,6 +13,8 @@ import os
 import json
 import tensorflow as tf
 from agentlace.action import ActionServer, ActionConfig
+import imageio
+import numpy as np 
 
 ## WORKING W SDK 
 def data_request(url):
@@ -21,6 +23,33 @@ def data_request(url):
     response = response.text
     return response
 
+def observation_format_numpy():
+    return [
+        ('timestamp_img', 'f4'),    # Float32
+        ('timestamp_data', 'f4'),
+        
+        ('battery', 'i4'),          # Int32
+        ('signal_level', 'i4'),
+        ('orientation', 'i4'),
+        ('lamp', 'i4'),
+        ('speed', 'f4'),            # Float32
+        ('gps_signal', 'f4'),
+        ('latitude', 'f4'),         # Float32 for precision with coordinates
+        ('longitude', 'f4'),
+        ('vibration', 'f4'),
+
+        ('accels', 'f4', (6, 4)),   # 6x4 Float32 matrix
+        ('gyros', 'f4', (5, 4)),    # 5x4 Float32 matrix
+        ('mags', 'f4', (1, 4)),     # 1x4 Float32 matrix
+        ('rpms', 'f4', (5, 5)),     # 5x5 Float32 matrix
+
+        ('last_action_linear', 'f4', (3,)),   # Float32 array of size 3
+        ('last_action_angular', 'f4', (3,)),  # Float32 array of size 3
+    ]
+
+# Function to extract values in the correct order
+def extract_ordered_values(observation, dtype):
+    return tuple(observation[key[0]] for key in dtype)
 
 def observation_format(observation_key_type):
     if observation_key_type == "frodobot":
@@ -53,6 +82,8 @@ def observation_format(observation_key_type):
         }
     else: 
         raise ValueError(f"Unknown observation config type {observation_key_type}")
+
+
 
 def record_data_format(observation_key_type):
     """ FOR RLDS (need is_first, is_last, is_terminal)"""
@@ -111,6 +142,18 @@ def send_velocity_command(url, linear, angular):
     else:
         return False
 
+def write_video(frames, save_path, byte_string_frames = False, fps=30):
+
+    writer = imageio.get_writer(save_path, fps=fps)
+
+    for frame in frames:
+        if frame is not None:
+            if byte_string_frames:
+                frame = decode_from_base64(frame)
+            frame = np.array(frame)
+            writer.append_data(frame)
+        
+    writer.close()
 
 ## PROCESSING DATA
 def decode_from_base64(base64_string):

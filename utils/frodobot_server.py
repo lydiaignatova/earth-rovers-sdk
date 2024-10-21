@@ -104,7 +104,9 @@ class FrodoServer():
         if response is None:
             return False
         
-        response["timestamp_data"] = tf.strings.to_number(response.pop("timestamp", None), out_type=tf.float32) 
+        response["timestamp_data"] = response.pop("timestamp", None)
+
+        # response["timestamp_data"] = tf.strings.to_number(response.pop("timestamp", None), out_type=tf.float32) 
         
         with lock:
             for key in response.keys():
