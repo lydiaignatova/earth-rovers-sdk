@@ -98,6 +98,7 @@ class Recorder():
         utils.write_video(self.imgs["rear"], f"{file_prefix}_rear.mp4", byte_string_frames = False, fps=30)
         utils.write_video(self.imgs["map"], f"{file_prefix}_map.mp4", byte_string_frames = False, fps=30)
 
+        print(f"Saved traj {self.traj_step}")
 
         # reset for next trajectory 
         self.traj_step += 1
