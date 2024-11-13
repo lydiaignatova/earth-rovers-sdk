@@ -48,7 +48,7 @@ def normalize_image(image: tf.Tensor) -> tf.Tensor:
 
 class Recorder():
 
-    def __init__(self, base_url, save_dir, max_time):
+    def __init__(self, base_url, save_step, save_dir, max_time):
 
         self.action_client = ActionClient(
             server_ip="localhost",
@@ -59,7 +59,7 @@ class Recorder():
         self.max_time = max_time
         self.start_time = time.time()
 
-        self.max_traj_len = 200
+        self.max_traj_len = save_step
 
         # set up save location 
         data_dir = save_dir
@@ -155,11 +155,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='My Python Script')
     parser.add_argument('--data_save_dir', type=str, help='Where to save collected data')
+    parser.add_argument('--save_step', type=int, default = 200, help='Frequency at which to split into trajectories')
     parser.add_argument('--max_time', type=int, help='How long to run for')
     parser.add_argument('--base_url', type=str, default="localhost",  help='What IP to connect to a robot action server on')
     args = parser.parse_args()
 
     Recorder(base_url= args.base_url,  
           save_dir = args.data_save_dir, 
+          save_step = args.save_step,
           max_time = args.max_time,
           ).run() 
