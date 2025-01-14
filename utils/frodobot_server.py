@@ -7,7 +7,6 @@ import json
 import time 
 import utils 
 
-
 from typing import Any, Optional, Tuple, Set, Callable
 
 
@@ -115,7 +114,7 @@ class FrodoServer():
         return True
     
     def image_request(self, lock):
-        url = f"{self.base_url}/screenshot"
+        url = f"{self.base_url}/v2/screenshot"
         response = requests.get(url) 
         if response is None:
             return False
