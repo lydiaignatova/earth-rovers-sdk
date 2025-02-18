@@ -66,8 +66,9 @@ def send_joystick_commands():
         while True:
             time.sleep(0.2)
             linear, angular = get_joystick_input()
-            print(f"GOT LINEAR {linear} ANGULAR {angular}")
-            action_client.act("action_vw", np.array([linear, angular]))
+            if not(linear == 0.0 and angular == 0.0):
+                print(f"GOT LINEAR {linear} ANGULAR {angular}")
+                action_client.act("action_vw", np.array([linear, angular]))
     except KeyboardInterrupt:
         print("Exiting joystick control")
 
