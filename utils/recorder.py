@@ -1,9 +1,3 @@
-# TFDS RECORDER!!!! that's the plan <3 
-
-
-# just one long ass trajectory i guess for now
-
-
 # generic imports
 import time
 import numpy as np
