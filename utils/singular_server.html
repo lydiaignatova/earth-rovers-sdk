@@ -1,27 +1,4 @@
-const express = require('express');
-const app = express();
-const port = 3000;
-const cors = require('cors');
-app.use(cors()); // This will allow all origins by default
-
-// Variables to store the last received data
-let lastMessage = 'No message received yet';
-let lastData = 'Nothing';
-let lat = '0.0';
-let long = '0.0';
-let ang = '0.0';
-
-// Middleware to parse JSON data from requests
-app.use(express.json());
-
-// Middleware to parse URL-encoded data from form submissions
-app.use(express.urlencoded({ extended: true }));
-
-// Define a route for the root path ('/')
-app.get('/', (req, res) => {
-  res.send(`
-
-    <html lang="en">
+<html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -91,8 +68,15 @@ app.get('/', (req, res) => {
         let messageInterval = null;
         let isSendingLocation = false;
     
-        const isIOS = /iPod|iPhone|iPad|Macintosh/.test(navigator.userAgent) && /AppleWebKit/.test(navigator.userAgent);
+        // const isIOS = /iPod|iPhone|iPad/.test(navigator.userAgent) && /AppleWebKit/.test(navigator.userAgent);
         
+        const isIOS = (() => {
+            if (navigator.userAgentData && navigator.userAgentData.platform) {
+                return /iPhone|iPad|iPod/i.test(navigator.userAgentData.platform);
+            }
+            return /iPhone|iPad|iPod/i.test(navigator.userAgent) && /AppleWebKit/i.test(navigator.userAgent);
+        })();
+
         // Button Logic
         function startCompass() {
             // Access to orientation 
@@ -110,8 +94,8 @@ app.get('/', (req, res) => {
                         })
                         .catch(() => alert("not supported"));
                 } else {
-                    document.getElementById('compassHeadingIndicator').innerText = "NOT an iphone orientation"  + navigator.userAgent;
-                    window.addEventListener("deviceorientationabsolute", compassHandler, true); 
+                    document.getElementById('compassHeadingIndicator').innerText = "NOT an iphone orientation";
+                    window.addEventListener("deviceorientationabsolute", compassHandler, true);
                 }
     
                 if (navigator.geolocation) {
@@ -254,35 +238,3 @@ app.get('/', (req, res) => {
         </script>
     </body>
     </html>
-
-  `);
-});
-
-// Define a route to handle GET requests for the last message
-app.get('/last-message', (req, res) => {
-  res.send(lastMessage); // Return only the last received message
-});
-
-app.get('/last-data', (req, res) => {
-  res.send(lastData); // Return only the last received data
-});
-
-// Route to handle POST requests to '/message'
-app.post('/message', (req, res) => {
-  lastMessage = req.body.message; // Store the received message
-  lat = req.body.latitude;
-  long = req.body.longitude;
-  ang = req.body.orientation;
-  lastData = req.body; // Store the entire data from the form
-
-  console.log('Lat', lat);
-  console.log('Lon', long);
-  console.log('Ang', ang);
-  console.log('Message', lastMessage);
-  res.redirect('/'); // Redirect back to the homepage after receiving the message});
-});
-
-// Start the server
-app.listen(port, () => {
-  console.log(`Server running at http://localhost:${port}`);
-});

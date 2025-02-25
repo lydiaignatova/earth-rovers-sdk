@@ -6,6 +6,8 @@ import numpy as np
 from collections import deque
 
 import os
+import utm 
+import math 
 import base64
 from io import BytesIO
 from PIL import Image
@@ -23,6 +25,19 @@ matplotlib.use("Agg")  # Use a non-interactive backend to work with multithreadi
 
 def convert_angle_compass_to_cartesian(compass):
     return(((360 - compass) % 360) + 90) % 360
+
+
+def calculate_relative_position(x_a, y_a, x_b, y_b):
+    delta_x = x_b - x_a
+    delta_y = y_b - y_a
+    return delta_x, delta_y
+
+def rotate_to_local_frame(delta_x, delta_y, heading_a_rad):
+    # Apply the rotation matrix for the local frame
+    relative_x = delta_x * math.cos(heading_a_rad) + delta_y * math.sin(heading_a_rad)
+    relative_y = -delta_x * math.sin(heading_a_rad) + delta_y * math.cos(heading_a_rad)
+    
+    return relative_x, relative_y
 
 def encode_image_to_base64(image_path):
     with open(image_path, "rb") as image_file:
@@ -49,18 +64,6 @@ def resize_images(byte_imgs):
     
     return resized_images
 
-help_prompt = f"""
-I am a wheeled robot, and you want to help me navigate to my desired goal position. I do not want to crash or enter streets that cars drive on. 
-
-I am giving you a birds eye view map of my environment. The blue dots represent positions I have visted. The green dot is my current position. The red point is my eventual goal.
-
-I am also giving you the image observations from my camera for the last 5 seconds.
-
-Based on this information, give me a general direction I should go in to make progress towards my goal, such as "go to the right", or "go to the trash can" or "back up".
-
-It should be brief, and for these specific circumstances. 
-"""
-
 
 class LLMHelper():
 
@@ -84,6 +87,7 @@ class LLMHelper():
 
         # Set up map info 
         self.goal_pose = goal_pose
+        self.goal_pose_utm = utm.from_latlon(goal_pose[0], goal_pose[1]) 
         self.marker_size = 10
 
         tiler = cimgt.OSM()
@@ -109,6 +113,21 @@ class LLMHelper():
 
         self.map_lock = threading.Lock()
 
+    def get_help_prompt(self, rel_goal_pos):
+        return f"""
+        I am a wheeled robot, and you want to help me navigate to my desired goal position. I do not want to crash, enter streets that cars drive on, or go down stairs. 
+
+        I am giving you a birds eye view map of my environment. The blue dots represent positions I have visted. The green dot is my current position and has an arrow pointing in my approximate current direction. The red point is my eventual goal.
+
+        I am also giving you the image observations from my camera for the last 5 seconds.
+
+        Based on this information, give me a general direction I should go in to make progress towards my goal, such as "go to the right", or "go to the trash can" or "back up".
+        Make sure that you're taking my current orientation into effect, which is indicated by the direction of the green arrow. "go straight" would go straight ahead in the direction of the arrow, and "go right" would go to the right from the direction the arrow is facing. 
+        At the moment, my final goal is {rel_goal_pos[0]} meters forward and {rel_goal_pos[1]} to the left of me. 
+        
+        Your direction should be brief, and for my specific circumstances. 
+        """
+
 
     def get_robot_data(self):
         last_run = time.time()  # Track when the last iteration ran
@@ -131,30 +150,37 @@ class LLMHelper():
             gpsdata = gpsdata.json() 
             self.position_deque.append((gpsdata["latitude"], gpsdata["longitude"], gpsdata["orientation"]))
 
-            rad_orientation = convert_angle_compass_to_cartesian(gpsdata["orientation"])
-
-            # rad_angles = np.radians([a for a in coords[:, 2]]) # generic gps already converted 
-            # # rad_angles = np.radians([convert_angle_compass_to_cartesian(a) for a in coords[:, 2]]) # convert from compass setup to counterclockwise 
-            # dx = np.cos(rad_angles)  # x-components of the vectors
-            # dy = np.sin(rad_angles)  # y-components of the vectors
-
+            rad_orientation = np.radians(convert_angle_compass_to_cartesian(gpsdata["orientation"]))
 
             # Update map
             self.map_lock.acquire()
             try:
                 if not self.no_pos:
                     for artist in reversed(self.ax.get_children()): # Make last pos a history point instead 
-                        if isinstance(artist, matplotlib.lines.Line2D) and artist.get_marker() == "o":
-                            artist.set_color("blue")  # Change latest to be a history point instead
-                            artist.set_markersize(self.marker_size // 2)
-                            break
-                self.ax.plot( # Plot new current position 
-                    gpsdata["longitude"], gpsdata["latitude"],
-                    marker="o", color="green", markersize=self.marker_size,
+                        if isinstance(artist, matplotlib.quiver.Quiver):  # Check if it's a quiver
+                            xdata, ydata = artist.U, artist.V  # Get quiver's vector components
+                            artist.remove()  # Remove the old quiver
+
+                            # Plot a history point at the quiver's location
+                            self.ax.plot(
+                                artist.X, artist.Y, 
+                                marker="o", color="blue", markersize=self.marker_size // 2,
+                                transform=ccrs.PlateCarree()
+                            )
+                            break  # Stop after modifying the most recent one
+
+                arrow_length = 50 
+                dx = arrow_length * np.cos(rad_orientation)
+                dy = arrow_length * np.sin(rad_orientation)
+
+                self.ax.quiver(
+                    np.array([gpsdata["longitude"]]), np.array([gpsdata["latitude"]]),  # Start position
+                    np.array([dx]), np.array([dy]),  # Direction vector
+                    angles='xy', scale_units='xy', scale=1, color="green",
                     transform=ccrs.PlateCarree()
                 )
+
                 self.no_pos = False
-                print("map updated ")
             finally:
                 self.map_lock.release()
 
@@ -178,12 +204,26 @@ class LLMHelper():
                 self.map_lock.release()
             img_b64_str_map = encode_image_to_base64("./current_map.png")
 
-
             # Get image history
             img_type_obs = "image/jpeg"
             img_history = []
             for i in range(-1, -len(self.image_deque), - self.obs_rate): # get 1 img per second
                 img_history.append(self.image_deque[i])
+
+            # Get latest position
+            gpsdata = self.position_deque[-1] 
+            cur_compass = cur_compass = -float(gpsdata[2])/180.0*3.141592 # don't reorient to have 0 as north 
+            cur_utm = utm.from_latlon(gpsdata[0], gpsdata[1]) 
+            del_x, del_y = calculate_relative_position(cur_utm[0], cur_utm[1], 
+                                                       self.goal_pose_utm[0], self.goal_pose_utm[1])
+            print("Del x", del_x, "del y", del_y, "compass", cur_compass)
+            rel_goal_pos = rotate_to_local_frame(del_x, del_y, cur_compass)
+            print("rel goal pos", rel_goal_pos)
+            rel_goal_pos = [rel_goal_pos[1], -rel_goal_pos[0]] # change it to be forward, left 
+            print("relative goal pose is ", rel_goal_pos )
+            
+            # Get help prompt
+            help_prompt = self.get_help_prompt(rel_goal_pos)
 
             # Get suggestion 
             self.api_start_time = time.time()
@@ -192,6 +232,8 @@ class LLMHelper():
                        {"type": "image_url",
                         "image_url": {"url": f"data:{img_type_map};base64,{img_b64_str_map}"}
                         }]
+                
+                img_history = resize_images(img_history)
                 
                 content.extend([{
                         "type": "image_url",
@@ -223,7 +265,7 @@ class LLMHelper():
 
                 print(response.text)
 
-            print(f"response took {time.time() - self.api_start_time} seconds to generate")
+            print(f"response took {time.time() - self.api_start_time} seconds to generate \n")
 
 
     def run(self):
@@ -255,5 +297,5 @@ if __name__ == "__main__":
         goal_pose = campanile_pos,
         obs_rate = 3,
         help_rate = 1,
-        api_name = "gemini",
+        api_name = "GPT",
     ).run()
