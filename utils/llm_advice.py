@@ -7,8 +7,13 @@ from collections import deque
 
 import os
 import base64
+from io import BytesIO
+from PIL import Image
 
 from openai import OpenAI
+
+from google import genai
+
 
 import cartopy.crs as ccrs
 import cartopy.io.img_tiles as cimgt
@@ -16,6 +21,8 @@ import matplotlib.pyplot as plt
 import matplotlib 
 matplotlib.use("Agg")  # Use a non-interactive backend to work with multithreading
 
+def convert_angle_compass_to_cartesian(compass):
+    return(((360 - compass) % 360) + 90) % 360
 
 def encode_image_to_base64(image_path):
     with open(image_path, "rb") as image_file:
@@ -23,6 +30,24 @@ def encode_image_to_base64(image_path):
         img_b64_str = img_b64_bytes.decode("utf-8")
     return img_b64_str
 
+def resize_images(byte_imgs):
+    resized_images = []
+    
+    for img_b64_str in byte_imgs:
+        img_data = base64.b64decode(img_b64_str)
+        img = Image.open(BytesIO(img_data))
+        
+        new_size = (img.width // 2, img.height // 2)
+        resized_img = img.resize(new_size).convert('RGB')
+
+        buffer = BytesIO()
+        resized_img.save(buffer, format="JPEG")  
+        buffer.seek(0)
+        
+        resized_img_b64 = base64.b64encode(buffer.read()).decode('utf-8')
+        resized_images.append(resized_img_b64)
+    
+    return resized_images
 
 help_prompt = f"""
 I am a wheeled robot, and you want to help me navigate to my desired goal position. I do not want to crash or enter streets that cars drive on. 
@@ -39,10 +64,17 @@ It should be brief, and for these specific circumstances.
 
 class LLMHelper():
 
-    def __init__(self, map_bounds, goal_pose, obs_rate, help_rate):
-        # Set up API Client
-        key = os.environ.get("OPENAI_API_KEY")
-        self.api_client = OpenAI(api_key = key)
+    def __init__(self, map_bounds, goal_pose, obs_rate, help_rate, api_name = "GPT"):
+        if api_name == "GPT":
+            # Set up API Client
+            key = os.environ.get("OPENAI_API_KEY")
+            self.api_client = OpenAI(api_key = key)
+        elif api_name == "gemini":
+            key = os.environ.get("GEMINI_API_KEY")
+            self.api_client = genai.Client(api_key=key)
+        else:
+            ValueError(f"{api_name} is not a valid LLM API")
+        self.api_name = api_name 
         self.help_rate = help_rate
 
         # Set up data stream
@@ -52,6 +84,7 @@ class LLMHelper():
 
         # Set up map info 
         self.goal_pose = goal_pose
+        self.marker_size = 10
 
         tiler = cimgt.OSM()
         tiler._executor = None # so it doesn't do multithraeding so that it plays nice later 
@@ -69,15 +102,10 @@ class LLMHelper():
         
         self.ax.plot( # Plot goal position 
                 self.goal_pose[1], self.goal_pose[0],
-                marker="o", color="red", markersize=marker_size, 
+                marker="o", color="red", markersize=self.marker_size, 
                 transform=ccrs.PlateCarree()
         )
-
-        self.ax.plot( # Plot extra point to remove as "start position"
-                self.goal_pose[1], self.goal_pose[0],
-                marker="o", color="green", markersize=marker_size, 
-                transform=ccrs.PlateCarree()
-        )
+        self.no_pos = True
 
         self.map_lock = threading.Lock()
 
@@ -103,20 +131,29 @@ class LLMHelper():
             gpsdata = gpsdata.json() 
             self.position_deque.append((gpsdata["latitude"], gpsdata["longitude"], gpsdata["orientation"]))
 
+            rad_orientation = convert_angle_compass_to_cartesian(gpsdata["orientation"])
+
+            # rad_angles = np.radians([a for a in coords[:, 2]]) # generic gps already converted 
+            # # rad_angles = np.radians([convert_angle_compass_to_cartesian(a) for a in coords[:, 2]]) # convert from compass setup to counterclockwise 
+            # dx = np.cos(rad_angles)  # x-components of the vectors
+            # dy = np.sin(rad_angles)  # y-components of the vectors
+
+
             # Update map
             self.map_lock.acquire()
             try:
-                for artist in reversed(self.ax.get_children()): # Make last pos a history point instead 
-                    if isinstance(artist, matplotlib.lines.Line2D) and artist.get_marker() == "o":
-                        artist.set_color("blue")  # Change latest to be a history point instead
-                        artist.set_markersize(marker_size // 2)
-                        break
-
+                if not self.no_pos:
+                    for artist in reversed(self.ax.get_children()): # Make last pos a history point instead 
+                        if isinstance(artist, matplotlib.lines.Line2D) and artist.get_marker() == "o":
+                            artist.set_color("blue")  # Change latest to be a history point instead
+                            artist.set_markersize(self.marker_size // 2)
+                            break
                 self.ax.plot( # Plot new current position 
                     gpsdata["longitude"], gpsdata["latitude"],
-                    marker="o", color="green", markersize=marker_size,
+                    marker="o", color="green", markersize=self.marker_size,
                     transform=ccrs.PlateCarree()
                 )
+                self.no_pos = False
                 print("map updated ")
             finally:
                 self.map_lock.release()
@@ -144,33 +181,48 @@ class LLMHelper():
 
             # Get image history
             img_type_obs = "image/jpeg"
-            img_info = []
+            img_history = []
             for i in range(-1, -len(self.image_deque), - self.obs_rate): # get 1 img per second
-                img_info.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{img_type_obs};base64,{self.image_deque[i]}"},
-                })
-
-            # Create context
-            content = [{"type": "text", "text": help_prompt}, 
-                       {"type": "image_url",
-                        "image_url": {"url": f"data:{img_type_map};base64,{img_b64_str_map}"}
-                        }]
-            content.extend(img_info)
+                img_history.append(self.image_deque[i])
 
             # Get suggestion 
             self.api_start_time = time.time()
-            response = self.api_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
-                ],
-                max_tokens = 1000,
-            )
-            print(response.choices[0].message.content)
+            if self.api_name == "GPT":
+                content = [{"type": "text", "text": help_prompt}, 
+                       {"type": "image_url",
+                        "image_url": {"url": f"data:{img_type_map};base64,{img_b64_str_map}"}
+                        }]
+                
+                content.extend([{
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{img_type_obs};base64,{img}"},
+                    } for img in img_history])
+
+
+                response = self.api_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": content,
+                        }
+                    ],
+                    max_tokens = 1000,
+                )
+                print(response.choices[0].message.content)
+            elif self.api_name == "gemini":
+
+                input_images = [img_b64_str_map] + img_history
+                input_images = resize_images(input_images)
+
+                contents = [help_prompt] +  input_images
+
+                response = self.api_client.models.generate_content(
+                    model="gemini-2.0-flash-exp",
+                    contents=contents)
+
+                print(response.text)
+
             print(f"response took {time.time() - self.api_start_time} seconds to generate")
 
 
@@ -197,12 +249,11 @@ if __name__ == "__main__":
     bounds = [[min_lat - border, min_long - border],
             [max_lat + border, max_long + border]]
 
-    marker_size = 10
-
 
     LLMHelper(
         map_bounds = bounds,
         goal_pose = campanile_pos,
         obs_rate = 3,
         help_rate = 1,
+        api_name = "gemini",
     ).run()
