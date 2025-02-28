@@ -45,24 +45,42 @@ def encode_image_to_base64(image_path):
         img_b64_str = img_b64_bytes.decode("utf-8")
     return img_b64_str
 
-def resize_images(byte_imgs):
-    resized_images = []
-    
-    for img_b64_str in byte_imgs:
-        img_data = base64.b64decode(img_b64_str)
-        img = Image.open(BytesIO(img_data))
-        
-        new_size = (img.width // 2, img.height // 2)
-        resized_img = img.resize(new_size).convert('RGB')
+def resize_image_byte(img_b64_str): 
+    img = byte_to_pil(img_b64_str)
 
-        buffer = BytesIO()
-        resized_img.save(buffer, format="JPEG")  
-        buffer.seek(0)
-        
-        resized_img_b64 = base64.b64encode(buffer.read()).decode('utf-8')
-        resized_images.append(resized_img_b64)
+    new_size = (img.width // 2, img.height // 2)
+    resized_img = img.resize(new_size)
     
-    return resized_images
+    return pil_to_byte(resized_img)
+
+
+def resize_images_byte(byte_imgs):
+    return [resize_image_byte(img_b64_str) for img_b64_str in byte_imgs]
+    
+
+def byte_to_pil(byte_img):
+    img_data = base64.b64decode(byte_img)
+    img = Image.open(BytesIO(img_data))
+    return img 
+
+
+def pil_to_byte(pil_img):
+    pil_img = pil_img.convert('RGB') # no more transparency 
+    buffer = BytesIO()
+    pil_img.save(buffer, format="JPEG")  
+    buffer.seek(0)
+    
+    base64_img = base64.b64encode(buffer.read()).decode('utf-8')
+    return base64_img
+
+
+def overlay_imgs(pil_img1, pil_img2):
+    pil_img1 = pil_img1.convert("RGBA")
+    pil_img2 = pil_img2.convert("RGBA")
+    """ Put second pic on first """
+    pil_img2 = pil_img2.resize(pil_img1.size)
+    result = Image.alpha_composite(pil_img1, pil_img2)
+    return result 
 
 
 class LLMHelper():
@@ -113,20 +131,42 @@ class LLMHelper():
 
         self.map_lock = threading.Lock()
 
+
+        self.map_angle_annotations =  { # with 0 being up, 90 being left 
+            "forward": (np.radians(0), "green"),           
+            "forward_right": (np.radians(-45), "yellow"),    
+            "forward_left": (np.radians(45), "blue"),    
+            "right": (np.radians(-90), "orange"),             
+            "left": (np.radians(90), "indigo"),              
+            "back": (np.radians(180), "pink"),          
+            "back_right": (np.radians(135), "red"),     
+            "back_left": (np.radians(225), "violet"),        
+        }
+
+        self.image_angle_annotations_pil = Image.open("directions overlay.png").convert("RGBA")
+
+
     def get_help_prompt(self, rel_goal_pos):
-        return f"""
-        I am a wheeled robot, and you want to help me navigate to my desired goal position. I do not want to crash, enter streets that cars drive on, or go down stairs. 
 
-        I am giving you a birds eye view map of my environment. The blue dots represent positions I have visted. The green dot is my current position and has an arrow pointing in my approximate current direction. The red point is my eventual goal.
+        prompt =  "I am a wheeled robot, and you want to help me navigate to my desired goal position. I do not want to crash, enter streets that cars drive on, or go down stairs."
 
-        I am also giving you the image observations from my camera for the last 5 seconds.
+        prompt += "I am giving you a birds eye view map of my environment. The blue dots represent positions I have visted. The red point is my eventual goal."
 
-        Based on this information, give me a general direction I should go in to make progress towards my goal, such as "go to the right", or "go to the trash can" or "back up".
-        Make sure that you're taking my current orientation into effect, which is indicated by the direction of the green arrow. "go straight" would go straight ahead in the direction of the arrow, and "go right" would go to the right from the direction the arrow is facing. 
-        At the moment, my final goal is {rel_goal_pos[0]} meters forward and {rel_goal_pos[1]} to the left of me. 
-        
-        Your direction should be brief, and for my specific circumstances. 
+        prompt += "My latest position is marked with the cluster of arrows indicating where I can go from here."
+
+
+        for direction in self.map_angle_annotations.keys():
+            angle_offset, color = self.map_angle_annotations[direction]
+            prompt += f"On both the latest image observation and the birds eye view map, going in {direction} is marked with a {color} arrow"   
+
+
+        prompt += f"At the moment, my final goal is {rel_goal_pos[0]} meters forward and {rel_goal_pos[1]} to the left of me."
+
+        prompt += """What general direction should I go, in my frame of reference, to get closer to the red goal?
+                    Don't use cardinal directions. Instead, tell me broadly to go right / left / straight / forward / backwards or a combination of those. 
         """
+
+        return prompt 
 
 
     def get_robot_data(self):
@@ -153,32 +193,64 @@ class LLMHelper():
             rad_orientation = np.radians(convert_angle_compass_to_cartesian(gpsdata["orientation"]))
 
             # Update map
+            offset_length = 30
             self.map_lock.acquire()
             try:
                 if not self.no_pos:
-                    for artist in reversed(self.ax.get_children()): # Make last pos a history point instead 
+                # Attempt 1 : History dots, arrow orientation 
+                #     for artist in reversed(self.ax.get_children()): # Make last pos a history point instead 
+                #         if isinstance(artist, matplotlib.quiver.Quiver):  # Check if it's a quiver
+                #             xdata, ydata = artist.U, artist.V  # Get quiver's vector components
+                #             artist.remove()  # Remove the old quiver
+
+                #             # Plot a history point at the quiver's location
+                #             self.ax.plot(
+                #                 artist.X, artist.Y, 
+                #                 marker="o", color="blue", markersize=self.marker_size // 2,
+                #                 transform=ccrs.PlateCarree()
+                #             )
+                #             break  # Stop after modifying the most recent one
+
+                # arrow_length = 50 
+                # dx = arrow_length * np.cos(rad_orientation)
+                # dy = arrow_length * np.sin(rad_orientation)
+
+                # self.ax.quiver(
+                #     np.array([gpsdata["longitude"]]), np.array([gpsdata["latitude"]]),  # Start position
+                #     np.array([dx]), np.array([dy]),  # Direction vector
+                #     angles='xy', scale_units='xy', scale=1, color="green",
+                #     transform=ccrs.PlateCarree()
+                # )
+
+                # Attempt 2: history dots, arrows for each possible direction
+                    # Clear old quivers 
+                    remove_left = len(self.map_angle_annotations.keys())
+                    for artist in reversed(self.ax.get_children()): # Remove old quivers
                         if isinstance(artist, matplotlib.quiver.Quiver):  # Check if it's a quiver
                             xdata, ydata = artist.U, artist.V  # Get quiver's vector components
                             artist.remove()  # Remove the old quiver
 
-                            # Plot a history point at the quiver's location
-                            self.ax.plot(
-                                artist.X, artist.Y, 
-                                marker="o", color="blue", markersize=self.marker_size // 2,
-                                transform=ccrs.PlateCarree()
-                            )
-                            break  # Stop after modifying the most recent one
+                            remove_left -= 1
 
-                arrow_length = 50 
-                dx = arrow_length * np.cos(rad_orientation)
-                dy = arrow_length * np.sin(rad_orientation)
-
-                self.ax.quiver(
-                    np.array([gpsdata["longitude"]]), np.array([gpsdata["latitude"]]),  # Start position
-                    np.array([dx]), np.array([dy]),  # Direction vector
-                    angles='xy', scale_units='xy', scale=1, color="green",
-                    transform=ccrs.PlateCarree()
-                )
+                            if remove_left == 0:
+                                self.ax.plot(
+                                    artist.X, artist.Y, 
+                                    marker="o", color="blue", markersize=self.marker_size // 2,
+                                    transform=ccrs.PlateCarree()
+                                )
+                                break  
+                
+                    for direction in self.map_angle_annotations.keys():
+                        angle_offset, color = self.map_angle_annotations[direction]
+                        total_angle = rad_orientation + angle_offset
+                        dx_offset = offset_length * np.cos(total_angle)
+                        dy_offset = offset_length * np.sin(total_angle)
+                        self.ax.quiver(
+                            np.array([cur_pos[1]]), np.array([cur_pos[0]]),  # Start position
+                            np.array([dx_offset]), np.array([dy_offset]),  # Direction vector
+                            angles='xy', scale_units='xy', scale=1.5, color= color,
+                            transform=ccrs.PlateCarree()
+                        )
 
                 self.no_pos = False
             finally:
@@ -209,9 +281,15 @@ class LLMHelper():
             img_history = []
             for i in range(-1, -len(self.image_deque), - self.obs_rate): # get 1 img per second
                 img_history.append(self.image_deque[i])
+            
+            if len(img_history) < 3:
+                continue  # wait for more observations 
+            
+            # Annotate the latest image observation
+            img_history[0] = pil_to_byte(overlay_imgs(byte_to_pil(img_history[0]), self.image_angle_annotations_pil))
 
 
-            # Get latest position
+            # Get latest position & Goal pose 
             gpsdata = self.position_deque[-1] 
             cur_compass = cur_compass = -float(gpsdata[2])/180.0*3.141592 # don't reorient to have 0 as north 
             cur_utm = utm.from_latlon(gpsdata[0], gpsdata[1]) 
@@ -234,7 +312,7 @@ class LLMHelper():
                         "image_url": {"url": f"data:{img_type_map};base64,{img_b64_str_map}"}
                         }]
                 
-                img_history = resize_images(img_history)
+                img_history = resize_images_byte(img_history)
                 
                 content.extend([{
                         "type": "image_url",
@@ -256,7 +334,7 @@ class LLMHelper():
             elif self.api_name == "gemini":
 
                 input_images = [img_b64_str_map] + img_history
-                input_images = resize_images(input_images)
+                input_images = resize_images_byte(input_images)
 
                 contents = [help_prompt] +  input_images
 
