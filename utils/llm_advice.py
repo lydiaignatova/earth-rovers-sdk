@@ -210,6 +210,7 @@ class LLMHelper():
             for i in range(-1, -len(self.image_deque), - self.obs_rate): # get 1 img per second
                 img_history.append(self.image_deque[i])
 
+
             # Get latest position
             gpsdata = self.position_deque[-1] 
             cur_compass = cur_compass = -float(gpsdata[2])/180.0*3.141592 # don't reorient to have 0 as north 
