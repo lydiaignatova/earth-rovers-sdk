@@ -186,9 +186,10 @@ class LLMHelper():
             self.image_deque.append(screenshot["front_frame"])
             
             # Get GPS data
-            gpsdata = requests.get("http://127.0.0.1:8000/data")  
+            gpsdata = requests.get("http://127.0.0.1:8000/data")
             gpsdata = gpsdata.json() 
             self.position_deque.append((gpsdata["latitude"], gpsdata["longitude"], gpsdata["orientation"]))
+            print("got position", gpsdata["latitude"], gpsdata["longitude"])
 
             rad_orientation = np.radians(convert_angle_compass_to_cartesian(gpsdata["orientation"]))
 
@@ -284,13 +285,14 @@ class LLMHelper():
             
             if len(img_history) < 3:
                 continue  # wait for more observations 
-            
+
             # Annotate the latest image observation
             img_history[0] = pil_to_byte(overlay_imgs(byte_to_pil(img_history[0]), self.image_angle_annotations_pil))
 
 
             # Get latest position & Goal pose 
             gpsdata = self.position_deque[-1] 
+            print("latest gps", gpsdata)
             cur_compass = cur_compass = -float(gpsdata[2])/180.0*3.141592 # don't reorient to have 0 as north 
             cur_utm = utm.from_latlon(gpsdata[0], gpsdata[1]) 
             del_x, del_y = calculate_relative_position(cur_utm[0], cur_utm[1], 
