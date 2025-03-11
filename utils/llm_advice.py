@@ -281,8 +281,7 @@ class LLMHelper():
 
         # Set up map info 
         self.map = Map(map_bounds)
-        self.map.plot_points([goal_pose], "blueviolet")
-        self.no_pos = True
+        self.map.add_grid(6, 15)
         self.map_lock = threading.Lock()
 
         # Goal Info 
@@ -290,36 +289,20 @@ class LLMHelper():
         self.goal_stack = deque()
         self.goal_stack.append(self.goal_pose_final)
 
+       
+        while len(self.position_deque) == 0:
+             self.get_robot_data() # Need to have the current position to plan trajectory! 
+
         intermediate_goals = self.get_intermediate_goals(self.goal_pose_final)
         for i in range(2, -1, -1): # just get the closest 2 - recompute once we're there. 
-            self.goal_stack.append(intermediate_goals[i])
+            self.goal_stack.append(self.map.coords_to_lat_long(
+                                                intermediate_goals[i][0],
+                                                intermediate_goals[i][1] ))
+
+        print("First goal at", self.map.coords_to_lat_long(self.goal_stack[-1][0],self.goal_stack[-1][1] ))
         
-        
 
-    def get_help_prompt(self, rel_goal_pos):
-
-        prompt =  "I am a wheeled robot, and you want to help me navigate to my desired goal position. I do not want to crash, enter streets that cars drive on, or go down stairs."
-
-        prompt += "I am giving you a birds eye view map of my environment. The blue dots represent positions I have visted. The red point is my eventual goal."
-
-        prompt += "My latest position is marked with the cluster of arrows indicating where I can go from here."
-
-
-        for direction in self.map_angle_annotations.keys():
-            angle_offset, color = self.map_angle_annotations[direction]
-            prompt += f"On both the latest image observation and the birds eye view map, going in {direction} is marked with a {color} arrow"   
-
-
-        prompt += f"At the moment, my final goal is {rel_goal_pos[0]} meters forward and {rel_goal_pos[1]} to the left of me."
-
-        prompt += """What general direction should I go, in my frame of reference, to get closer to the red goal?
-                    Don't use cardinal directions. Instead, tell me broadly to go right / left / straight / forward / backwards or a combination of those. 
-        """
-
-        return prompt 
-
-
-    def get_robot_data(self):
+    def get_robot_data_loop(self):
         last_run = time.time()  # Track when the last iteration ran
         interval = 1 / self.obs_rate
 
@@ -330,24 +313,35 @@ class LLMHelper():
 
             last_run = current_time 
 
-            # Get most recent data from robot
-            screenshot = requests.get("http://127.0.0.1:8000/v2/screenshot")
-            screenshot = screenshot.json() 
-            self.image_deque.append(screenshot["front_frame"])
-            
-            # Get GPS data
-            gpsdata = requests.get("http://127.0.0.1:8000/data")
-            gpsdata = gpsdata.json() 
-            new_pos = (gpsdata["latitude"], gpsdata["longitude"], gpsdata["orientation"])
-            self.position_deque.append(new_pos)
+            self.get_robot_data()
 
-            # Add GPS data to map history if it isn't the same as before 
-            if len(self.position_deque) < 2 or self.position_deque[-2] != new_pos:
-                self.map_lock.acquire()
-                try:
-                    self.map.plot_points([new_pos[:2]], "cyan")
-                finally:
-                    self.map_lock.release()
+
+    def get_robot_data(self):
+        # Get most recent data from robot
+        screenshot = requests.get("http://127.0.0.1:8000/v2/screenshot")
+        screenshot = screenshot.json() 
+        self.image_deque.append(screenshot["front_frame"])
+        
+        # Get GPS data
+        robotdata = requests.get("http://127.0.0.1:8000/data")
+        robotdata = robotdata.json() 
+
+        # if robotdata["latitude"] == 1000:
+        #     print("Lost GPS signal, got 1000")
+        #     return 
+        
+        gpsdata = requests.get("http://127.0.0.1:3000/last-data")
+        gpsdata = gpsdata.json()
+        new_pos = (gpsdata["latitude"], gpsdata["longitude"], robotdata["orientation"])
+        self.position_deque.append(new_pos)
+
+        # Add GPS data to map history if it isn't the same as before 
+        if len(self.position_deque) < 2 or self.position_deque[-2] != new_pos:
+            self.map_lock.acquire()
+            try:
+                self.map.plot_points([new_pos[:2]], "cyan")
+            finally:
+                self.map_lock.release()
 
 
     def latest_goal_dist(self):
@@ -364,22 +358,27 @@ class LLMHelper():
         return math.sqrt(del_x ** 2 + del_y ** 2)
 
 
-    def get_intermediate_goals(self, goal_pos, spacing=50):
+    def get_intermediate_goals(self, goal_pos, spacing=50, was_stuck = False):
 
         # Figure out how many waypoints we want
         cur_pos = self.position_deque[-1]
         dist = dist_between_latlon(cur_pos, goal_pos)
-        num = dist // spacing
+        num = dist // spacing + 1 
 
         # Set up prompt
-        goal_prompt = f"""I am a small wheeled root trying to navigate an environment. In this overhead map, my position is marked with a bright fuchsia dot, locations I have visited are marked with light blue dots, red dots indicate spots I have gotten stuck at or couldn't make progress from, and a purple dot represents my goal position. The map is split into a coordinate grid, with labels along the x and y axis. First, what is my approximate current position? What is the approximate goal position? Use precision up to 3 decimal spots, such as 2.568. Now, give me a path from my current position to the goal position using {num} intermediate waypoints. I am a wheeled robot, so going through buildings, which are marked in brown on the map, is impossible and causes me to get stuck. Always prioritize staying on white, gray, or red roads. This means you might sometimes need to move further away from the goal to ultimately make progress. Format the path like this [(x, y), (x, y), ..., (x, y)]. Don't include the start pose or the goal pose in the path."""
+        goal_prompt = f"""I am a small wheeled root trying to navigate an environment. In this overhead map, my position is marked with a bright fuchsia dot, locations I have visited are marked with light blue dots, red dots indicate spots I have gotten stuck at or couldn't make progress from, and a purple dot represents my goal position. I am small compared to the size of the plotted dots, so I can go through narrow areas on the map. The map is split into a coordinate grid, with labels along the x (bottom) and y (vertical) axis. First, find the maximum x value and the maximum y value. What are those bounds on my map? Next, what is my approximate current position in the coordinate grid? What is the approximate goal position?  Use precision up to 3 decimal spots, such as 2.568. Now, give me a path from my current position to the goal position using {num} intermediate waypoints. I am a wheeled robot, so going through buildings, which are marked in brown on the map, is impossible and causes me to get stuck. Always prioritize staying on white, gray, or red roads. This means you might sometimes need to move further away from the goal to ultimately make progress. Format the path like this [(x, y), (x, y), ..., (x, y)]. Don't include the start pose or the goal pose in the path."""
+
+        if was_stuck:
+            goal_prompt += "I am currently STUCK in my position and I haven't made progress in 30 seconds, so you espeically should consider a creative path going around buildings instead of taking a straighter approach."
 
         # Set up map (plot cur pos, goal pos)
         self.map_lock.acquire()
         try:
-            self.map.plot_points(cur_pos, "fuchsia")
-            self.map.plot_points(goal_pos, "blueviolet")
+            self.map.plot_points([cur_pos[:2]], "fuchsia")
+            self.map.plot_points([goal_pos[:2]], "blueviolet")
             self.map.save_map("./goals.png")
+            self.map.remove_points(1, "fuchsia")
+            self.map.remove_points(1, "blueviolet")
         finally:
             self.map_lock.release()
 
@@ -388,7 +387,66 @@ class LLMHelper():
         img_b64_str_map = resize_image_byte(img_b64_str_map)
 
         # Send Query
-        self.api_start_time = time.time()
+        api_start_time = time.time()
+        if self.api_name == "GPT":
+            content = [{"type": "text", "text": goal_prompt}, 
+                    {"type": "image_url",
+                    "image_url": {"url": f"data:{img_type_map};base64,{img_b64_str_map}"}
+                    }]
+            
+            response = self.api_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": content,
+                    }
+                ],
+                max_tokens = 1000,
+            )
+            ans = response.choices[0].message.content
+        elif self.api_name == "gemini":
+            input_images = [img_b64_str_map] 
+            contents = [goal_prompt] +  input_images
+
+            response = self.api_client.models.generate_content(
+                model="gemini-2.0-flash", # not -exp
+                contents=contents)
+            ans = response.text
+        print(f"Initial response took {time.time() - api_start_time} seconds to generate \n")
+        print("full answer", ans)
+
+        goals = get_tuples_list_floats(ans) # extract out waypoints
+        print("\n\nGot Goals", goals)
+
+        # Skip first waypoint if it was generated too close to the current position 
+        first_goal = goals[0]
+        if dist_between_latlon(self.map.coords_to_lat_long(first_goal[0], first_goal[1]), cur_pos) < GOAL_THRES + 1:
+            goals = goals[1:] 
+
+        # Refine goals with visual feedback 
+        goal_refine_prompt = f""" I originally asked you this: \n {goal_prompt}
+        Here is your predicted path, {goals}, displayed with orange dots. Please adjust any waypoints as you see fit to make sure you don't go through brown buildings, going around them instead. 
+        """
+
+        # Annotate map with predicted goals & then restore the map to just history 
+        self.map_lock.acquire()
+        try:
+            self.map.plot_points([cur_pos[:2]], "fuchsia")
+            self.map.plot_points([goal_pos[:2]], "blueviolet")
+            self.map.plot_points(goals, "orange", False)
+            self.map.save_map("./goals.png")
+            self.map.remove_points(1, "fuchsia")
+            self.map.remove_points(1, "blueviolet")
+            self.map.remove_points(len(goals), "orange")
+        finally:
+            self.map_lock.release()
+
+        img_type_map = "image/png"
+        img_b64_str_map = encode_image_to_base64("./goals.png")
+        img_b64_str_map = resize_image_byte(img_b64_str_map)
+
+        api_start_time = time.time()
         if self.api_name == "GPT":
             content = [{"type": "text", "text": goal_prompt}, 
                     {"type": "image_url",
@@ -414,163 +472,98 @@ class LLMHelper():
                 model="gemini-2.0-flash-exp",
                 contents=contents)
             ans = response.text
+        print(f"Refined response took {time.time() - api_start_time} seconds to generate \n")
 
-        goals = get_tuples_list_floats(ans) # extract out goal pos 
-
-        print(f"response took {time.time() - self.api_start_time} seconds to generate \n")
-
-
-        # Get goals from query 
-        get_tuples_list_floats(response.text)
-        # Plot + Refine goals 
-
-
-        # add goals
-
-        self.map.remove_points(1, "fuchsia")
-        self.map.plot_points([gpsdata["longitude"]]), np.array([gpsdata["latitude"]], "fuchsia")
-
-        
-        start_pos = (5.000, 4.000)
-        goal_pos = (11, 3.8)
-        my_map.plot_points([start_pos], ["fuchsia"], False)
-        # my_map.plot_points([goal_pos], ["blueviolet"], False)
-
-        # my_map.plot_points([(4.900, 3.700)], ["blueviolet"], False)
-        my_map.plot_points([campanile_pos], ["blueviolet"])
-        # my_map.plot_points([(4.4, 3.0)], ["blueviolet"], False)
-
-        my_map.save_map("griddy.png")
-
-        # remove goals 
-        
-
-        return goals
+        goals = get_tuples_list_floats(ans) # extract out waypoints
+        return goals 
 
     def runner(self):
 
-        # Get starting distance from goal
-        last_dist = self.latest_goal_dist()
+        # Keep track of distance from goal 
         dist_check = 30 # if we haven't made progress (2 meters) in 30 seconds, that's a issue 
+        dist_update = 1
+        dist_thres = 2
         last_check = time.time()
+        last_update = time.time()
+        latest_distances = deque(maxlen = dist_check)
+        latest_distances.append(self.latest_goal_dist)
+
+        num_goals_before_replan = 1
+
+
+        just_stuck = False
 
         while True:
             cur_dist = self.latest_goal_dist()
+
+            # Keep track of distance from goal 
+            if time.time() - last_update > dist_update:
+                latest_distances.append(cur_dist)
             
             # Check if we've reached the closest goal 
             if cur_dist < GOAL_THRES:
-                
                 self.goal_stack.pop()
+                num_goals_before_replan -= 1
 
-                print("Goal while processing is", self.goal_stack[-1])
+                print(f"Next goal is {self.map.coords_to_lat_long(self.goal_stack[-1][0],self.goal_stack[-1][1] )}")
 
-                intermediate_goals = self.get_intermediate_goals(self.goal_pose_final)
-                self.goal_stack.pop()
+                if num_goals_before_replan == 0:
 
-                for i in range(2, -1, -1): # just get the closest 2 - recompute once we're there. 
-                    self.goal_stack.append(intermediate_goals[i])
+                    intermediate_goals = self.get_intermediate_goals(self.goal_pose_final, spacing = 50)
+                    self.goal_stack.pop()
 
-                print("New goal at", self.goal_stack[-1])
+                    for i in range(2, -1, -1): # just save the closest 2 - recompute once we reach one 
+                        self.goal_stack.append(self.map.coords_to_lat_long(
+                                                intermediate_goals[i][0],
+                                                intermediate_goals[i][1] ))
+                    num_goals_before_replan = len(self.goal_stack) - 2
 
-            
+                    print("New goal at", self.map.coords_to_lat_long(self.goal_stack[-1][0],self.goal_stack[-1][1] ))
+
             # Check if we're stuck 
-            if cur_dist + 2 >= last_dist:
-                print("STUCK!")
+            if time.time() - last_check > dist_check and cur_dist + dist_thres >= latest_distances[0]:
+                print(f"No progress made in {dist_check} seconds, used to be {latest_distances[0]} away and is now {cur_dist} away")
 
-                self.get_help_prompt 
+                # Try to get a more granular approach to the *closest* goal if this is the first time we're stuck here
+                if not just_stuck:
 
-            stack[-1] if stack
+                    intermediate_goals = self.get_intermediate_goals(self.goal_stack[-1], spacing = 7)
 
+                    for i in range(len(intermediate_goals) -1, -1, -1): # want ENTIRE little trajectory 
+                        self.goal_stack.append(self.map.coords_to_lat_long(
+                                                intermediate_goals[i][0],
+                                                intermediate_goals[i][1] ))
+                    num_goals_before_replan = len(self.goal_stack) - 2
+                    just_stuck = True 
+                else:
+                    # mark area as STUCK
+                    print("STUCK, pause operation for now")
 
-            # Check if we've made progress towards teh goal 
+                    self.map_lock.acquire()
+                    try:
+                        self.map.plot_points([self.position_deque[-1][:2]], "red")
+                    finally:
+                        self.map_lock.release()
 
+                    # Fully replan 
+                    self.goal_stack.clear()
+                    self.goal_stack.append(self.goal_pose_final)
 
-            # ask for help if it's been 5 seconds with on progress 
+                    intermediate_goals = self.get_intermediate_goals(self.goal_pose_final, spacing = 50, was_stuck = True)
 
+                    for i in range(2, -1, -1): # just save the closest 2 - recompute once we reach one 
+                        self.goal_stack.append(self.map.coords_to_lat_long(
+                                                intermediate_goals[i][0],
+                                                intermediate_goals[i][1] ))
+                    num_goals_before_replan = len(self.goal_stack) - 2
 
-            # Get new intermediate goal 
+                    print("New goal at", self.map.coords_to_lat_long(self.goal_stack[-1][0],self.goal_stack[-1][1] ), "resume operation ")
+                    just_stuck = False
 
-
-            # Get latest map 
-            img_type_map = "image/png"
-            plt.savefig("./current_map.png", dpi=300, bbox_inches="tight")
-            img_b64_str_map = encode_image_to_base64("./current_map.png")
-
-            # Get image history
-            img_type_obs = "image/jpeg"
-            img_history = []
-            for i in range(-1, -len(self.image_deque), - self.obs_rate): # get 1 img per second
-                img_history.append(self.image_deque[i])
-            
-            if len(img_history) < 3:
-                continue  # wait for more observations 
-
-            # Annotate the latest image observation
-            img_history[0] = pil_to_byte(overlay_imgs(byte_to_pil(img_history[0]), self.image_angle_annotations_pil))
-
-
-            # Get latest position & Goal pose 
-            gpsdata = self.position_deque[-1] 
-            print("latest gps", gpsdata)
-            cur_compass = -float(gpsdata[2])/180.0*3.141592 # don't reorient to have 0 as north 
-            cur_utm = utm.from_latlon(gpsdata[0], gpsdata[1]) 
-            goal_utm = utm.from_latlon()
-            del_x, del_y = calculate_relative_position(cur_utm[0], cur_utm[1], 
-                                                       self.goal_pose_utm[0], self.goal_pose_utm[1])
-            print("Del x", del_x, "del y", del_y, "compass", cur_compass)
-            rel_goal_pos = rotate_to_local_frame(del_x, del_y, cur_compass)
-            print("rel goal pos", rel_goal_pos)
-            rel_goal_pos = [rel_goal_pos[1], -rel_goal_pos[0]] # change it to be forward, left 
-            print("relative goal pose is ", rel_goal_pos )
-            
-            # Get help prompt
-            help_prompt = self.get_help_prompt(rel_goal_pos)
-
-            # Get suggestion 
-            self.api_start_time = time.time()
-            if self.api_name == "GPT":
-                content = [{"type": "text", "text": help_prompt}, 
-                       {"type": "image_url",
-                        "image_url": {"url": f"data:{img_type_map};base64,{img_b64_str_map}"}
-                        }]
-                
-                img_history = resize_images_byte(img_history)
-                
-                content.extend([{
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{img_type_obs};base64,{img}"},
-                    } for img in img_history])
-
-
-                response = self.api_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": content,
-                        }
-                    ],
-                    max_tokens = 1000,
-                )
-                print(response.choices[0].message.content)
-            elif self.api_name == "gemini":
-
-                input_images = [img_b64_str_map] + img_history
-                input_images = resize_images_byte(input_images)
-
-                contents = [help_prompt] +  input_images
-
-                response = self.api_client.models.generate_content(
-                    model="gemini-2.0-flash-exp",
-                    contents=contents)
-
-                print(response.text)
-
-            print(f"response took {time.time() - self.api_start_time} seconds to generate \n")
 
 
     def run(self):
-        data_thread = threading.Thread(target=self.get_robot_data, daemon = False)
+        data_thread = threading.Thread(target=self.get_robot_data_loop, daemon = False)
         main_thread = threading.Thread(target=self.runner, daemon = False)
 
         data_thread.start()
