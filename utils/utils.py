@@ -15,8 +15,276 @@ import tensorflow as tf
 # from agentlace.action import ActionServer, ActionConfig
 import imageio
 import numpy as np 
+import math 
+import utm 
+import re
 
-## WORKING W SDK 
+
+from openai import OpenAI
+
+from google import genai
+
+import cartopy.crs as ccrs
+import cartopy.io.img_tiles as cimgt
+
+
+#####################
+### POSITION DATA ###
+#####################
+
+def convert_angle_compass_to_cartesian(compass):
+    return(((360 - compass) % 360) + 90) % 360
+
+
+def calculate_relative_position(x_a, y_a, x_b, y_b):
+    delta_x = x_b - x_a
+    delta_y = y_b - y_a
+    return delta_x, delta_y
+
+def rotate_to_local_frame(delta_x, delta_y, heading_a_rad):
+    # Apply the rotation matrix for the local frame
+    relative_x = delta_x * math.cos(heading_a_rad) + delta_y * math.sin(heading_a_rad)
+    relative_y = -delta_x * math.sin(heading_a_rad) + delta_y * math.cos(heading_a_rad)
+    
+    return relative_x, relative_y
+
+
+def points_between(start, end, num):
+    x_points = np.linspace(start[0], end[0], num) 
+    y_points = np.linspace(start[1], end[1], num) 
+
+    points = [(x, y) for x, y in zip(x_points, y_points)]
+    return points 
+
+
+def dist_between_latlon(start, end):
+     start_pos = utm.from_latlon(start[0], start[1])
+     end_pos = utm.from_latlon(end[0], end[1])
+
+     return np.linalg.norm(np.array(start_pos[:2]) - np.array(end_pos[:2]))
+
+##################
+### IMAGE DATA ###
+##################
+
+def encode_image_to_base64(image_path):
+    with open(image_path, "rb") as image_file:
+        img_b64_bytes = base64.b64encode(image_file.read())
+        img_b64_str = img_b64_bytes.decode("utf-8")
+    return img_b64_str
+
+def resize_image_byte(img_b64_str, factor = 2): 
+    img = byte_to_pil(img_b64_str)
+
+    new_size = (int(img.width / factor), int(img.height / factor))
+    resized_img = img.resize(new_size)
+    
+    return pil_to_byte(resized_img)
+
+
+def resize_images_byte(byte_imgs):
+    return [resize_image_byte(img_b64_str) for img_b64_str in byte_imgs]
+    
+
+def byte_to_pil(byte_img):
+    img_data = base64.b64decode(byte_img)
+    img = Image.open(BytesIO(img_data))
+    return img 
+
+
+def pil_to_byte(pil_img):
+    pil_img = pil_img.convert('RGB') # no more transparency 
+    buffer = BytesIO()
+    pil_img.save(buffer, format="JPEG")  
+    buffer.seek(0)
+    
+    base64_img = base64.b64encode(buffer.read()).decode('utf-8')
+    return base64_img
+
+
+def overlay_imgs(pil_img1, pil_img2):
+    pil_img1 = pil_img1.convert("RGBA")
+    pil_img2 = pil_img2.convert("RGBA")
+    """ Put second pic on first """
+    pil_img2 = pil_img2.resize(pil_img1.size)
+    result = Image.alpha_composite(pil_img1, pil_img2)
+    return result 
+
+################
+### LLM DATA ###
+################
+
+
+def get_tuples_list_floats(text):
+    # Get rid of comments 
+    text = re.sub(r'#.*', '', text)  # Removes inline and standalone comments
+
+    # Extract the path using a regular expression
+    match = re.search(r'\[\s*(\([^)]*\),?\s*)+\]', text)  # Matches the entire list of tuples
+
+    if match:
+        path_string = match.group(0)  # Get the matched string
+
+        # Clean up the string and split it into tuples
+        path_string = path_string.replace(" ", "")  # Remove spaces to enable proper splitting
+        path_string = path_string.replace("[", "")  # Remove the leading bracket
+        path_string = path_string.replace("]", "")  # Remove the ending bracket
+        tuples_string = path_string.split("),")    # Split into strings representing tuples
+        tuples_string = [t.replace(")", "") for t in tuples_string] # Clean out last bracket in each tuple
+
+        # Convert the string tuples to a list of float tuples
+        path = []
+        for t in tuples_string:
+            coords = t.replace("(", "").split(",") # Clean out brackets and split the numbers in the tuple
+            try:
+                x, y = float(coords[0]), float(coords[1])
+                path.append((x, y))
+            except (ValueError, IndexError) as e:
+                print(f"Skipping invalid tuple format: {t}. Error: {e}") # Handles the missing bracket in each split.
+
+        return path 
+    else:
+        print(f"No path found in the text. {text}")
+
+
+########### 
+### MAP ###
+###########
+
+class Map():
+
+    def __init__(self, bounds, border=0.001):
+        """ Bounds entered as [[min_lat, min_long], [max_lat, max_long]]"""
+
+        self.bounds = bounds 
+        self.min_lat, self.min_long = self.bounds[0]
+        self.max_lat, self.max_long = self.bounds[1]
+
+        tiler = cimgt.OSM()
+        crs = tiler.crs
+
+        self.fig, self.ax = plt.subplots(
+            figsize=(12, 10),
+            subplot_kw={"projection": crs}
+        )
+
+        self.ax.set_extent([bounds[0][1], bounds[1][1] , 
+                    bounds[0][0], bounds[1][0]], 
+                    crs=ccrs.PlateCarree())
+        self.ax.add_image(tiler, 18)  # Add OpenStreetMap tiles; zoom level lower values = less zoomed-in
+        
+        self.rows = self.cols = None 
+
+    def save_map(self, path):
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+
+    def visualize(self):
+        plt.show()
+
+    def add_grid(self, rows, cols):
+        if self.rows is not None or self.cols is not None:
+            raise ValueError("Grid already added to map, cannot add another one.")
+        
+        self.gridlines = []
+        self.gridlabels = []
+        self.rows, self.cols = rows, cols
+
+        # Generate lat/lon grid points
+        latitudes = np.linspace(self.min_lat, self.max_lat, self.rows + 1)
+        longitudes = np.linspace(self.min_long, self.max_long, self.cols + 1)
+
+        # Plot horizontal grid lines and add row labels
+        for i, lat in enumerate(latitudes):
+            line = self.ax.plot([self.min_long, self.max_long], [lat, lat], 
+                    color="black", linewidth=0.5, linestyle="--", 
+                    transform=ccrs.PlateCarree())
+
+            row_label = f"{i}" 
+            label = self.ax.text(self.min_long - 0.0003, lat, row_label, 
+                    fontsize=10, ha="right", va="center", color="black",
+                    transform=ccrs.PlateCarree())
+            
+            self.gridlines.append(line)
+            self.gridlabels.append(label)
+
+        # Plot vertical grid lines and add column labels
+        for j, lon in enumerate(longitudes):
+            line = self.ax.plot([lon, lon], [self.min_lat, self.max_lat], 
+                    color="black", linewidth=0.5, linestyle="--", 
+                    transform=ccrs.PlateCarree())
+
+            col_label = f"{j}" 
+            label = self.ax.text(lon, self.min_lat - 0.0003, col_label, 
+                    fontsize=10, ha="center", va="top", color="black",
+                    transform=ccrs.PlateCarree())
+            
+            self.gridlines.append(line)
+            self.gridlabels.append(label)
+
+    def remove_grid(self):
+        if self.rows is None and self.cols is None:
+            raise ValueError("Grid has not been added to map, cannot remove.")
+        
+        for line in self.gridlines:
+            line[0].remove()
+
+        for label in self.gridlabels:
+            label.remove()
+
+        self.rows = self.cols =  None
+        self.gridlines = self.gridlabels = None
+
+    def plot_points(self, points, colors, lat_lon = True, size = 9):
+        if isinstance(colors, list) and not isinstance(colors, str):
+            if len(points) != len(colors):
+                raise ValueError(f"Must have lengths of lists for plotting equal, have {len(points)} points but {len(colors)} colors")
+        else:
+            color = colors 
+
+        for i in range(len(points)):
+            lat, lon = points[i]
+
+            if not lat_lon:
+                lat, lon = self.coords_to_lat_long(lat, lon)
+
+            if isinstance(colors, list) and not isinstance(colors, str):
+                color = colors[i]
+
+            self.ax.plot(lon, lat, marker="o", color=color, markersize=size, transform=ccrs.PlateCarree())
+            
+    def remove_points(self, num, color):
+        count = 0
+        for line in reversed(self.ax.lines):  
+            if line.get_marker() == "o" and line.get_color() == color:
+                line.remove()
+                count += 1
+                if count >= num:  # Stop after removing 'num' points
+                    break  
+
+    def coords_to_lat_long(self, x, y):
+        if self.rows is None or self.cols is None:
+            raise ValueError("Cannot compute coordinates from lat long without a grid")
+        
+        long  = self.min_long + x * (self.max_long - self.min_long) / self.cols
+        lat = self.min_lat + y * (self.max_lat - self.min_lat) / self.rows
+
+        return lat, long 
+    
+    def lat_long_to_coords(self, lat, long):
+        if self.rows is None or self.cols is None:
+            raise ValueError("Cannot compute lat long from coordinates without a grid")
+        
+        x = (long - self.min_long) / ((self.max_long - self.min_long) / self.cols)
+        y = (lat - self.min_lat) / ((self.max_lat - self.min_lat) / self.rows)
+
+        return x, y 
+
+
+###############
+### SDK USE ###
+###############
+
+
 def data_request(url):
     url = f"{url}/data"
     response = requests.get(url)
@@ -159,68 +427,3 @@ def write_video(frames, save_path, byte_string_frames = False, fps=30):
 def decode_from_base64(base64_string):
     image = Image.open(BytesIO(base64.b64decode(base64_string)))
     return image
-
-
-    def send_joy_commands(self):
-        events = pygame.event.get()
-        
-        if len(events) > 0:
-            event = events[0]
-            print(f"got event {event}")
-            print(f"event type {type(event)} with event type {event.type}")
-        else:
-            return False
-        
-
-        if event.type == pygame.JOYAXISMOTION:
-            linear = self.joystick.get_axis(4)*-1
-            angular = self.joystick.get_axis(3)*-1
-            self.send_velocity_command(linear, angular)
-        elif event.type == 1538: # lower left hand size joystick thing
-            print(f"value is {event.value} with type {type(event.value)}")
-            linear =  0.2 * event.value[1]
-            angular = -0.4 * event.value[0]
-            self.send_velocity_command(linear, angular)
-
-        return True
-
-    def image_loop(self, lock):
-        while True:
-            self.image_request(lock)
-            time.sleep(1/self.frame_rate)
-    
-    def data_loop(self, lock):
-        while True:
-            self.data_request(lock)
-            time.sleep(1/self.data_rate)
-
-    # Main loop which receives data and sends commands
-    def start(self):
-        print("Starting API Interface")
-        lock = threading.Lock()
-        image_thread = threading.Thread(target=self.image_loop, args=(lock,))
-        data_thread = threading.Thread(target=self.data_loop, args=(lock,))
-        image_thread.start()
-        data_thread.start()
-        try: 
-            while True:
-                if self.command_interface == "joystick":
-                    self.send_joy_commands()
-                elif self.command_interface == "keyboard":
-                    self.send_key_commands()
-        except KeyboardInterrupt:
-            image_thread.join()
-            data_thread.join()
-            pygame.quit()
-            print("Exiting API Interface")
-    
-if __name__ == "__main__":
-    api_key = os.getenv("SDK_API_TOKEN")
-    api_interface = APIInterface(api_key, "http://localhost:8000", "joystick", frame_rate=30, data_rate=30)
-    api_interface.start()
-
-
-
-
-    
-    
