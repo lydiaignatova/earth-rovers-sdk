@@ -7,8 +7,10 @@ from collections import deque
 
 import re
 import os
+import sys
 import utm 
 import math 
+import select 
 import base64
 from io import BytesIO
 from PIL import Image
@@ -25,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")  # Use a non-interactive backend to work with multithreading
 
 
-GOAL_THRES = 10 # 10 meters away - counts as reaching the goal! 
+GOAL_THRES = 20 # 10 meters away - counts as reaching the goal! 
 
 import utils 
 
@@ -69,7 +71,7 @@ class LLMHelper():
 
 
         
-        for i in range(2, -1, -1): # just get the closest 2 - recompute once we're there. 
+        for i in range(2, -1, -1): # just get the closest 3 - recompute once we're there. 
             self.goal_stack.append(self.map.coords_to_lat_long(
                                                 intermediate_goals[i][0],
                                                 intermediate_goals[i][1] ))
@@ -105,9 +107,9 @@ class LLMHelper():
         #     print("Lost GPS signal, got 1000")
         #     return 
         
-        # gpsdata = requests.get("http://127.0.0.1:3000/last-data")
-        # gpsdata = gpsdata.json()
-        gpsdata = robotdata 
+        gpsdata = requests.get("http://127.0.0.1:3000/last-data")
+        gpsdata = gpsdata.json()
+        # gpsdata = robotdata 
 
         new_pos = (gpsdata["latitude"], gpsdata["longitude"], robotdata["orientation"])
         # self.position_deque.append(new_pos)
@@ -144,7 +146,7 @@ class LLMHelper():
         num = dist // spacing + 1 
 
         # Set up prompt
-        goal_prompt = f"""I am a small wheeled root trying to navigate an environment. In this overhead map, my position is marked with a bright fuchsia dot, locations I have visited are marked with light blue dots, red dots indicate spots I have gotten stuck at or couldn't make progress from, and a purple dot represents my goal position. I am small compared to the size of the plotted dots, so I can go through narrow areas on the map. The map is split into a coordinate grid, with labels along the x (bottom) and y (vertical) axis. 
+        goal_prompt = f"""I am a small wheeled root trying to navigate an environment. In this overhead map, my position is marked with a bright fuchsia dot, locations I have visited are marked with light blue dots, red dots indicate spots I have gotten stuck at or couldn't make progress from such as stairs or dead ends, and a purple dot represents my goal position. I am small compared to the size of the plotted dots, so I can go through narrow areas on the map. The map is split into a coordinate grid, with labels along the x (bottom) and y (vertical) axis. 
         
         First, find the maximum x value and the maximum y value. What are those bounds on my map? 
         
@@ -152,12 +154,12 @@ class LLMHelper():
         
         Now, give me a path from my current position to the goal position using {num} intermediate waypoints. I am a wheeled robot, so I *must* stay on roads (white, gray, or light red areas). Traveling through buildings (marked in brown) is strictly forbidden and will cause me to get stuck.
 
-        The path you provide *must* be a continuous sequence of waypoints that a wheeled robot can realistically follow. Each waypoint must be reachable from the previous waypoint *without* passing through any buildings or off-road areas. This means you might sometimes need to move further away from the goal to ultimately make progress. 
+        The path you provide *must* be a smooth continuous sequence of waypoints that a wheeled robot can realistically follow. You cannot teleport from one path to an adjacent one. Each waypoint must be reachable from the previous waypoint *without* passing through any buildings or off-road areas. This means you might sometimes need to move a little bit further away from the goal to ultimately make progress. 
         
-        Format the path like this [(x, y), (x, y), ..., (x, y)].  Use precision up to 3 decimal spots, such as 2.568. Don't include the start pose or the goal pose in the path."""
+        Format the path like this [(x, y), (x, y), ..., (x, y)].  Use precision up to 3 decimal spots, such as 2.568. Don't include the start pose or the final goal pose in the path."""
 
         if was_stuck:
-            goal_prompt += "I am currently STUCK in my position and I haven't made progress in 30 seconds, so you espeically should consider a creative path going around buildings instead of taking a straighter approach."
+            goal_prompt += "I am currently STUCK in my position and I haven't made progress in 30 seconds, so you especially should consider a creative path going around buildings instead of taking a straighter approach."
 
         # Set up map (plot cur pos, goal pos)
         self.map_lock.acquire()
@@ -227,7 +229,7 @@ class LLMHelper():
 
         # Refine goals with visual feedback 
         goal_refine_prompt = f""" I originally asked you this: \n {goal_prompt}
-        Here is your predicted path, {goals}, displayed with dots using the virdis colormap, which goes from purple to yellow. With this information, adjust the waypoints, making sure that the path is continuous and does not go through buildings.
+        Here is your predicted path, {goals}, displayed with orange dots. With this information, adjust the waypoints, making sure that the path is continuous and does not go through buildings.
         """
 
         # Annotate map with predicted goals & then restore the map to just history 
@@ -235,7 +237,8 @@ class LLMHelper():
         try:
             self.map.plot_points([cur_pos[:2]], "fuchsia", size=9)
             self.map.plot_points([goal_pos[:2]], "blueviolet", size=9)
-            self.map.plot_points(goals, [plt.cm.viridis(i / (len(goals)-1)) for i in range(len(goals))], False, size=9)
+            self.map.plot_points(goals, "orange", False, size=9)
+            # self.map.plot_points(goals, [plt.cm.viridis(i / (len(goals)-1)) for i in range(len(goals))], False, size=9)
             self.map.save_map("./goals.png")
             self.map.remove_points(1, "fuchsia")
             self.map.remove_points(1, "blueviolet")
@@ -290,11 +293,30 @@ class LLMHelper():
 
         goals = utils.get_tuples_list_floats(ans) # extract out waypoints
         return goals 
+    
+    def replan(self, goal, spacing, keep_num):
+
+        intermediate_goals = None
+        while intermediate_goals is None:
+            intermediate_goals = self.get_intermediate_goals(self.goal_pose_final, spacing = 50)
+
+        self.goal_stack.pop()
+
+        for i in range(keep_num - 1, -1, -1): # just save the closest num 
+            self.goal_stack.append(self.map.coords_to_lat_long(
+                                    intermediate_goals[i][0],
+                                    intermediate_goals[i][1] ))
+        
+
+        print(f"New goal at {self.goal_stack[-1][0]:.8f} , {self.goal_stack[-1][1]:.8f}" )
+
+
+
 
     def runner(self):
 
         # Keep track of distance from goal 
-        dist_check = 30 # if we haven't made progress (2 meters) in 30 seconds, that's a issue 
+        dist_check = 120 # if we haven't made progress (2 meters) in 120 seconds, that's a issue 
         dist_update = 1
         dist_thres = 2
         last_check = time.time()
@@ -308,6 +330,22 @@ class LLMHelper():
         just_stuck = False
 
         while True:
+            # get feedback on being stuck from robot
+            i, o, e = select.select([sys.stdin], [], [], 0.001)
+            if i:
+                received_input = sys.stdin.readline().strip()
+                if "unsafe" in received_input:
+
+                    # Mark spot as UNSAFE 
+                    self.map_lock.acquire()
+                    try:
+                        self.map.plot_points([self.position_deque[-1][:2]], "red", size=12)
+                    finally:
+                        self.map_lock.release()
+
+                print("recieved input", received_input)
+
+
             cur_dist = self.latest_goal_dist()
 
             # Keep track of distance from goal 
@@ -324,21 +362,10 @@ class LLMHelper():
                 print(f"Goal reached! Next goal is {self.goal_stack[-1][0]:.8f} , {self.goal_stack[-1][1]:.8f}")
 
                 if num_goals_before_replan == 0:
-
-                    intermediate_goals = None
-                    while intermediate_goals is None:
-                        intermediate_goals = self.get_intermediate_goals(self.goal_pose_final, spacing = 50)
-
-                    self.goal_stack.pop()
-
-                    for i in range(2, -1, -1): # just save the closest 2 - recompute once we reach one 
-                        self.goal_stack.append(self.map.coords_to_lat_long(
-                                                intermediate_goals[i][0],
-                                                intermediate_goals[i][1] ))
+                    print("Replanning")
+                    self.replan(self.goal_pose_final, spacing = 50, keep_num = 3)
+                    
                     num_goals_before_replan = len(self.goal_stack) - 2
-
-                    print(f"New goal at {self.goal_stack[-1][0]:.8f} , {self.goal_stack[-1][1]:.8f}" )
-
                     latest_distances.clear()
                     cur_dist = self.latest_goal_dist()
                     latest_distances.append(cur_dist)
@@ -348,54 +375,25 @@ class LLMHelper():
             if time.time() - last_check > dist_check and cur_dist + dist_thres >= latest_distances[0]:
                 print(f"No progress made in {dist_check} seconds, used to be {latest_distances[0]} away and is now {cur_dist} away")
 
-                # Try to get a more granular approach to the *closest* goal if this is the first time we're stuck here
-                if not just_stuck:
-                    intermediate_goals = None
-                    while intermediate_goals is None:
-                        intermediate_goals = self.get_intermediate_goals(self.goal_stack[-1], spacing = 10)
+                print("STUCK, pause operation for now")
 
-                    for i in range(len(intermediate_goals) -1, -1, -1): # want ENTIRE little trajectory 
-                        self.goal_stack.append(self.map.coords_to_lat_long(
-                                                intermediate_goals[i][0],
-                                                intermediate_goals[i][1] ))
-                    num_goals_before_replan = len(self.goal_stack) - 2
-                    just_stuck = True 
-                else:
-                    # mark area as STUCK
-                    print("STUCK, pause operation for now")
+                # Fully replan 
+                self.goal_stack.clear()
+                self.goal_stack.append(self.goal_pose_final)
 
-                    # ends up getting overwritten by history points... 
-                    self.map_lock.acquire()
-                    try:
-                        self.map.plot_points([self.position_deque[-1][:2]], "red", size=12)
-                    finally:
-                        self.map_lock.release()
-
-                    # Fully replan 
-                    self.goal_stack.clear()
-                    self.goal_stack.append(self.goal_pose_final)
-
-                    intermediate_goals = None
-                    while intermediate_goals is None:
-                        intermediate_goals = self.get_intermediate_goals(self.goal_pose_final, spacing = 50)
-
-
-                    for i in range(2, -1, -1): # just save the closest 2 - recompute once we reach one 
-                        self.goal_stack.append(self.map.coords_to_lat_long(
-                                                intermediate_goals[i][0],
-                                                intermediate_goals[i][1] ))
-                    num_goals_before_replan = len(self.goal_stack) - 2
-
-                    just_stuck = False
-                last_check = time.time()
+                self.replan(self.goal_pose_final, spacing = 50, keep_num = 3)
+                    
+                num_goals_before_replan = len(self.goal_stack) - 2
                 latest_distances.clear()
                 cur_dist = self.latest_goal_dist()
                 latest_distances.append(cur_dist)
+                last_update = time.time()
+                
                 print(f"New goal at {self.goal_stack[-1][0]:.8f} , {self.goal_stack[-1][1]:.8f} resume operation ")
 
     def run(self):
-        data_thread = threading.Thread(target=self.get_robot_data_loop, daemon = False)
-        main_thread = threading.Thread(target=self.runner, daemon = False)
+        data_thread = threading.Thread(target=self.get_robot_data_loop, daemon = True)
+        main_thread = threading.Thread(target=self.runner, daemon = True)
 
         data_thread.start()
         main_thread.start()
